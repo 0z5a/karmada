@@ -1230,3 +1230,130 @@ func TestAreResourceListsEqual(t *testing.T) {
 		})
 	}
 }
+
+func TestAddResourceLists(t *testing.T) {
+	tests := []struct {
+		name   string
+		list1  corev1.ResourceList
+		list2  corev1.ResourceList
+		expect corev1.ResourceList
+	}{
+		{
+			name:   "both nil should return empty",
+			list1:  nil,
+			list2:  nil,
+			expect: corev1.ResourceList{},
+		},
+		{
+			name: "known resource names are summed",
+			list1: corev1.ResourceList{
+				corev1.ResourceCPU: resource.MustParse("100m"),
+			},
+			list2: corev1.ResourceList{
+				corev1.ResourceCPU: resource.MustParse("50m"),
+			},
+			expect: corev1.ResourceList{
+				corev1.ResourceCPU: resource.MustParse("150m"),
+			},
+		},
+		{
+			name: "limits and requests resource names are preserved and summed",
+			list1: corev1.ResourceList{
+				corev1.ResourceName("limits.cpu"):      resource.MustParse("200m"),
+				corev1.ResourceName("requests.memory"): resource.MustParse("64Mi"),
+			},
+			list2: corev1.ResourceList{
+				corev1.ResourceName("limits.cpu"):      resource.MustParse("400m"),
+				corev1.ResourceName("requests.memory"): resource.MustParse("128Mi"),
+			},
+			expect: corev1.ResourceList{
+				corev1.ResourceName("limits.cpu"):      resource.MustParse("600m"),
+				corev1.ResourceName("requests.memory"): resource.MustParse("192Mi"),
+			},
+		},
+		{
+			name: "keys only present in one list are kept as-is",
+			list1: corev1.ResourceList{
+				corev1.ResourceName("limits.cpu"): resource.MustParse("200m"),
+			},
+			list2: corev1.ResourceList{
+				corev1.ResourceName("requests.cpu"): resource.MustParse("100m"),
+			},
+			expect: corev1.ResourceList{
+				corev1.ResourceName("limits.cpu"):   resource.MustParse("200m"),
+				corev1.ResourceName("requests.cpu"): resource.MustParse("100m"),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := addResourceLists(tt.list1, tt.list2)
+			if !areResourceListsEqual(got, tt.expect) {
+				t.Errorf("addResourceLists() = %v, want %v", got, tt.expect)
+			}
+		})
+	}
+}
+
+func TestLimitsQuotaBoundaryWithAggregator(t *testing.T) {
+	oldGates := features.FeatureGate.DeepCopy()
+	if err := features.FeatureGate.Set(fmt.Sprintf("%s=true", features.FederatedQuotaEnforcement)); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { features.FeatureGate = oldGates })
+
+	makeRB := func(replicas int32, limit string) *workv1alpha2.ResourceBinding {
+		rb := makeTestRB("limits-ns", "limits-rb", WithClusters([]workv1alpha2.TargetCluster{{Name: "member", Replicas: replicas}}))
+		rb.Spec.ReplicaRequirements = &workv1alpha2.ReplicaRequirements{
+			ResourceRequest: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("300m")},
+			ResourceLimits:  corev1.ResourceList{corev1.ResourceCPU: resource.MustParse(limit)},
+		}
+		return rb
+	}
+	for _, tt := range []struct {
+		name       string
+		old        *workv1alpha2.ResourceBinding
+		new        *workv1alpha2.ResourceBinding
+		used       string
+		allowed    bool
+		wantStatus string
+	}{
+		{"one replica", nil, makeRB(1, "1500m"), "0", true, "1500m"},
+		{"equal quota", nil, makeRB(2, "1500m"), "0", true, "3"},
+		{"third replica denied", makeRB(2, "1500m"), makeRB(3, "1500m"), "3", false, "3"},
+		{"limits-only increase denied", makeRB(2, "1500m"), makeRB(2, "2"), "3", false, "3"},
+		{"scale down releases quota", makeRB(2, "1500m"), makeRB(1, "1500m"), "3", true, "1500m"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			frq := makeTestFRQ("limits-ns", "limits-frq",
+				WithOverallLimits(corev1.ResourceList{corev1.ResourceName("limits.cpu"): resource.MustParse("3")}),
+				WithOverallUsed(corev1.ResourceList{corev1.ResourceName("limits.cpu"): resource.MustParse(tt.used)}))
+			fakeClient := fake.NewClientBuilder().WithScheme(testScheme).WithObjects(frq).WithStatusSubresource(&policyv1alpha1.FederatedResourceQuota{}).Build()
+			operation := admissionv1.Create
+			if tt.old != nil {
+				operation = admissionv1.Update
+			}
+			request := newAdmissionRequestBuilder(t, operation, tt.new.Namespace, tt.new.Name, tt.name).WithObject(tt.new)
+			decoder := &fakeDecoder{decodeObj: tt.new, rawDecodedObj: tt.old}
+			if tt.old != nil {
+				request.WithOldObject(tt.old)
+			}
+			response := (&ValidatingAdmission{Client: fakeClient, Decoder: decoder}).Handle(context.Background(), request.Build())
+			if response.Allowed != tt.allowed {
+				t.Fatalf("allowed=%v, want %v: %+v", response.Allowed, tt.allowed, response)
+			}
+			if !tt.allowed && (response.Result == nil || response.Result.Reason != util.QuotaExceededReason) {
+				t.Fatalf("expected quota denial, got %+v", response)
+			}
+			current := &policyv1alpha1.FederatedResourceQuota{}
+			if err := fakeClient.Get(context.Background(), client.ObjectKeyFromObject(frq), current); err != nil {
+				t.Fatal(err)
+			}
+			quantity := current.Status.OverallUsed[corev1.ResourceName("limits.cpu")]
+			if quantity.Cmp(resource.MustParse(tt.wantStatus)) != 0 {
+				t.Fatalf("overallUsed limits.cpu=%s, want %s", quantity.String(), tt.wantStatus)
+			}
+		})
+	}
+}

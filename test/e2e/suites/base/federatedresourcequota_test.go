@@ -361,6 +361,83 @@ var _ = ginkgo.Describe("FederatedResourceQuota enforcement testing", func() {
 		})
 	})
 
+	ginkgo.It("enforces limits across updates and replica changes with quota aggregation", func() {
+		name := deploymentNamePrefix + rand.String(RandomStrLength)
+		limitKey := corev1.ResourceName("limits.cpu")
+		overall := corev1.ResourceList{
+			corev1.ResourceCPU: resource.MustParse("10"), limitKey: resource.MustParse("3"),
+		}
+		frq := helper.NewFederatedResourceQuotaWithOverall(frqNamespace, frqName, overall)
+		framework.CreateFederatedResourceQuota(karmadaClient, frq)
+		ginkgo.DeferCleanup(func() { framework.RemoveFederatedResourceQuota(karmadaClient, frqNamespace, frqName) })
+		framework.WaitFederatedResourceQuotaFitWith(karmadaClient, frqNamespace, frqName, func(current *policyv1alpha1.FederatedResourceQuota) bool {
+			return checker.DeepEqual(current.Status.Overall, overall)
+		})
+
+		deployment := helper.NewDeployment(deployNamespace, name)
+		deployment.Spec.Replicas = ptr.To[int32](2)
+		deployment.Spec.Template.Spec.Containers[0].Resources = corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m")},
+			Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1500m")},
+		}
+		policy := helper.NewPropagationPolicy(deployNamespace, name, []policyv1alpha1.ResourceSelector{{
+			APIVersion: deployment.APIVersion, Kind: deployment.Kind, Name: name,
+		}}, policyv1alpha1.Placement{ClusterAffinity: &policyv1alpha1.ClusterAffinity{ClusterNames: clusterNames}})
+		framework.CreateDeployment(kubeClient, deployment)
+		ginkgo.DeferCleanup(func() { framework.RemoveDeployment(kubeClient, deployNamespace, name) })
+		framework.CreatePropagationPolicy(karmadaClient, policy)
+		ginkgo.DeferCleanup(func() { framework.RemovePropagationPolicy(karmadaClient, deployNamespace, name) })
+
+		rbName := names.GenerateBindingName(deployment.Kind, name)
+		waitBinding := func(replicas int32, limit string) {
+			framework.WaitResourceBindingFitWith(karmadaClient, deployNamespace, rbName, func(rb *workv1alpha2.ResourceBinding) bool {
+				return rb.Spec.ReplicaRequirements != nil && len(rb.Spec.Clusters) == 1 &&
+					rb.Spec.Clusters[0].Replicas == replicas &&
+					rb.Spec.ReplicaRequirements.ResourceLimits.Cpu().Cmp(resource.MustParse(limit)) == 0
+			})
+		}
+		waitUsed := func(amount string) {
+			framework.WaitFederatedResourceQuotaFitWith(karmadaClient, frqNamespace, frqName, func(current *policyv1alpha1.FederatedResourceQuota) bool {
+				used := current.Status.OverallUsed[limitKey]
+				return used.Cmp(resource.MustParse(amount)) == 0
+			})
+		}
+		waitBinding(2, "1500m")
+		waitUsed("3")
+
+		framework.UpdateDeploymentWith(kubeClient, deployNamespace, name, func(current *appsv1.Deployment) {
+			current.Spec.Template.Spec.Containers[0].Resources.Limits[corev1.ResourceCPU] = resource.MustParse("2")
+		})
+		framework.WaitEventFitWith(kubeClient, deployNamespace, name, func(event corev1.Event) bool {
+			return event.Reason == events.EventReasonApplyPolicyFailed && strings.Contains(event.Message, admissionWebhookDenyMsgPrefix)
+		})
+		waitBinding(2, "1500m")
+		waitUsed("3")
+
+		framework.UpdateDeploymentWith(kubeClient, deployNamespace, name, func(current *appsv1.Deployment) {
+			current.Spec.Template.Spec.Containers[0].Resources.Limits[corev1.ResourceCPU] = resource.MustParse("1500m")
+		})
+		framework.UpdateDeploymentWith(kubeClient, deployNamespace, name, func(current *appsv1.Deployment) {
+			current.Spec.Replicas = ptr.To[int32](3)
+		})
+		framework.WaitEventFitWith(kubeClient, deployNamespace, rbName, func(event corev1.Event) bool {
+			return event.Reason == events.EventReasonScheduleBindingFailed && strings.Contains(event.Message, admissionWebhookDenyMsgPrefix)
+		})
+		waitBinding(2, "1500m")
+		waitUsed("3")
+
+		framework.UpdateDeploymentWith(kubeClient, deployNamespace, name, func(current *appsv1.Deployment) {
+			current.Spec.Replicas = ptr.To[int32](1)
+		})
+		waitBinding(1, "1500m")
+		waitUsed("1500m")
+		framework.UpdateDeploymentWith(kubeClient, deployNamespace, name, func(current *appsv1.Deployment) {
+			current.Spec.Replicas = ptr.To[int32](2)
+		})
+		waitBinding(2, "1500m")
+		waitUsed("3")
+	})
+
 	ginkgo.Context("[Compute resource] FederatedResourceQuota should be enforced correctly", func() {
 		var policyNamespace, policyName string
 		var deploymentNamespace, deploymentName string
